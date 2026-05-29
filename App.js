@@ -4,7 +4,7 @@ import {
   ActivityIndicator, ScrollView
 } from 'react-native';
 import { useState } from 'react';
-import { GOOGLE_MAPS_API_KEY } from './Config';
+import { GOOGLE_MAPS_API_KEY, ANTHROPIC_API_KEY } from './Config';
 import polyline from '@mapbox/polyline';
 
 // Check if a point is close enough to the route line
@@ -41,6 +41,34 @@ const haversineDistance = (lat1, lng1, lat2, lng2) => {
     Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
     Math.sin(dLng / 2) * Math.sin(dLng / 2);
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+};
+
+const getCoachingScript = async (zoneName) => {
+  try {
+    const response = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': ANTHROPIC_API_KEY,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: 'claude-sonnet-4-20250514',
+        max_tokens: 150,
+        messages: [{
+          role: 'user',
+          content: `You are a calm driving coach. A driver is about to lose GPS signal entering "${zoneName}". 
+          Give them ONE specific, practical coaching tip in 2 sentences max. 
+          Tell them what lane to stay in and what landmark to look for. 
+          Be direct and confident. No fluff.`
+        }]
+      })
+    });
+    const data = await response.json();
+    return data.content[0].text;
+  } catch (err) {
+    return 'Stay alert and note your surroundings before signal drops.';
+  }
 };
 
 const getDeadZones = async (points) => {
@@ -118,9 +146,18 @@ export default function App() {
         const points = polyline.decode(encoded);
 
         // Scan for dead zones
-        const tunnels = await getDeadZones(points);
+const tunnels = await getDeadZones(points);
 
-        setRouteData({
+// Get AI coaching for each dead zone
+const coached = await Promise.all(
+  tunnels.map(async (zone) => {
+    const name = zone.tags?.name || zone.tags?.description || 'this tunnel';
+    const coaching = await getCoachingScript(name);
+    return { ...zone, coaching };
+  })
+);
+
+setRouteData({
           distance: route.distance.text,
           duration: route.duration.text,
           steps: route.steps.length,
@@ -128,7 +165,7 @@ export default function App() {
           end: route.end_address,
         });
 
-        setDeadZones(tunnels);
+       setDeadZones(coached);
 
       } else {
         setError(`Could not find route: ${data.status}`);
@@ -221,8 +258,8 @@ export default function App() {
                   {zone.tags?.name || zone.tags?.description || 'Tunnel — GPS signal will drop'}
                 </Text>
                 <Text style={styles.deadZoneAdvice}>
-                  📍 Stay aware of your surroundings. Note landmarks before entering.
-                </Text>
+  📍 {zone.coaching || 'Stay alert and note your surroundings before signal drops.'}
+</Text>
               </View>
             ))}
           </View>
