@@ -1,21 +1,53 @@
 import {
   StyleSheet, Text, View, TextInput,
-  TouchableOpacity, SafeAreaView, KeyboardAvoidingView,
-  Platform, ActivityIndicator, ScrollView
+  TouchableOpacity, SafeAreaView,
+  ActivityIndicator, ScrollView
 } from 'react-native';
 import { useState } from 'react';
 import { GOOGLE_MAPS_API_KEY } from './Config';
+import polyline from '@mapbox/polyline';
 
 export default function App() {
   const [destination, setDestination] = useState('');
   const [loading, setLoading] = useState(false);
   const [routeData, setRouteData] = useState(null);
+  const [deadZones, setDeadZones] = useState([]);
   const [error, setError] = useState(null);
+
+  const getDeadZones = async (points) => {
+    // Build bounding box around route points
+    const lats = points.map(p => p[0]);
+    const lngs = points.map(p => p[1]);
+    const south = Math.min(...lats);
+    const north = Math.max(...lats);
+    const west = Math.min(...lngs);
+    const east = Math.max(...lngs);
+
+    // Query OpenStreetMap Overpass API for tunnels
+    const query = `
+      [out:json];
+      way["tunnel"="yes"](${south},${west},${north},${east});
+      out geom;
+    `;
+
+    try {
+      const response = await fetch('https://overpass-api.de/api/interpreter', {
+        method: 'POST',
+        body: query,
+      });
+      const data = await response.json();
+      return data.elements || [];
+    } catch (err) {
+      console.log('Overpass error:', err);
+      return [];
+    }
+  };
 
   const previewRoute = async () => {
     setLoading(true);
     setError(null);
     setRouteData(null);
+    setDeadZones([]);
 
     try {
       const response = await fetch(
@@ -25,6 +57,14 @@ export default function App() {
 
       if (data.status === 'OK') {
         const route = data.routes[0].legs[0];
+
+        // Decode the polyline into GPS coordinates
+        const encoded = data.routes[0].overview_polyline.points;
+        const points = polyline.decode(encoded);
+
+        // Scan for dead zones
+        const tunnels = await getDeadZones(points);
+
         setRouteData({
           distance: route.distance.text,
           duration: route.duration.text,
@@ -32,6 +72,9 @@ export default function App() {
           start: route.start_address,
           end: route.end_address,
         });
+
+        setDeadZones(tunnels);
+
       } else {
         setError(`Could not find route: ${data.status}`);
       }
@@ -107,6 +150,33 @@ export default function App() {
               <Text style={styles.addressLabel}>TO</Text>
               <Text style={styles.addressText}>{routeData.end}</Text>
             </View>
+          </View>
+        )}
+
+        {/* Dead Zones */}
+        {deadZones.length > 0 && (
+          <View style={styles.deadZoneSection}>
+            <Text style={styles.deadZoneTitle}>
+              ⚠️  {deadZones.length} GPS Dead Zone{deadZones.length > 1 ? 's' : ''} Detected
+            </Text>
+            {deadZones.map((zone, index) => (
+              <View key={index} style={styles.deadZoneCard}>
+                <Text style={styles.deadZoneLabel}>DEAD ZONE {index + 1}</Text>
+                <Text style={styles.deadZoneName}>
+                  {zone.tags?.name || zone.tags?.description || 'Tunnel — GPS signal will drop'}
+                </Text>
+                <Text style={styles.deadZoneAdvice}>
+                  📍 Stay aware of your surroundings. Note landmarks before entering.
+                </Text>
+              </View>
+            ))}
+          </View>
+        )}
+
+        {/* No Dead Zones */}
+        {routeData && deadZones.length === 0 && (
+          <View style={styles.clearCard}>
+            <Text style={styles.clearText}>✅  No GPS dead zones on this route</Text>
           </View>
         )}
 
@@ -243,6 +313,50 @@ const styles = StyleSheet.create({
     fontSize: 13,
     color: '#CBD5E1',
     marginBottom: 8,
+  },
+  deadZoneSection: {
+    gap: 12,
+  },
+  deadZoneTitle: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: '#FB923C',
+  },
+  deadZoneCard: {
+    backgroundColor: '#2D1A0E',
+    borderRadius: 16,
+    padding: 20,
+    gap: 8,
+    borderWidth: 1,
+    borderColor: '#92400E',
+  },
+  deadZoneLabel: {
+    fontSize: 10,
+    fontWeight: '700',
+    color: '#FB923C',
+    letterSpacing: 1.5,
+  },
+  deadZoneName: {
+    fontSize: 15,
+    fontWeight: '600',
+    color: '#FED7AA',
+  },
+  deadZoneAdvice: {
+    fontSize: 13,
+    color: '#9A7B6A',
+  },
+  clearCard: {
+    backgroundColor: '#0F2D1A',
+    borderRadius: 16,
+    padding: 20,
+    borderWidth: 1,
+    borderColor: '#166534',
+    alignItems: 'center',
+  },
+  clearText: {
+    fontSize: 15,
+    fontWeight: '600',
+    color: '#4ADE80',
   },
   badge: {
     backgroundColor: '#1E2D3D',
