@@ -7,41 +7,96 @@ import { useState } from 'react';
 import { GOOGLE_MAPS_API_KEY } from './Config';
 import polyline from '@mapbox/polyline';
 
+// Check if a point is close enough to the route line
+const isNearRoute = (tunnelLat, tunnelLng, routePoints, thresholdMeters = 50) => {
+  for (let i = 0; i < routePoints.length - 1; i++) {
+    const lat1 = routePoints[i][0];
+    const lng1 = routePoints[i][1];
+    const lat2 = routePoints[i + 1][0];
+    const lng2 = routePoints[i + 1][1];
+    const dist = pointToSegmentDistance(tunnelLat, tunnelLng, lat1, lng1, lat2, lng2);
+    if (dist < thresholdMeters) return true;
+  }
+  return false;
+};
+
+// Calculate distance in meters between a point and a line segment
+const pointToSegmentDistance = (px, py, ax, ay, bx, by) => {
+  const dx = bx - ax;
+  const dy = by - ay;
+  const lenSq = dx * dx + dy * dy;
+  let t = lenSq !== 0 ? ((px - ax) * dx + (py - ay) * dy) / lenSq : 0;
+  t = Math.max(0, Math.min(1, t));
+  const nearX = ax + t * dx;
+  const nearY = ay + t * dy;
+  return haversineDistance(px, py, nearX, nearY);
+};
+
+// Haversine formula - converts lat/lng difference to meters
+const haversineDistance = (lat1, lng1, lat2, lng2) => {
+  const R = 6371000;
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLng = (lng2 - lng1) * Math.PI / 180;
+  const a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+    Math.sin(dLng / 2) * Math.sin(dLng / 2);
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+};
+
+const getDeadZones = async (points) => {
+  const lats = points.map(p => p[0]);
+  const lngs = points.map(p => p[1]);
+  const south = Math.min(...lats);
+  const north = Math.max(...lats);
+  const west = Math.min(...lngs);
+  const east = Math.max(...lngs);
+
+  const query = `
+    [out:json];
+    (
+      way["tunnel"="yes"]["highway"~"motorway|trunk|primary|secondary|tertiary"](${south},${west},${north},${east});
+    );
+    out geom;
+  `;
+
+  try {
+    const response = await fetch('https://overpass-api.de/api/interpreter', {
+      method: 'POST',
+      body: query,
+    });
+    const data = await response.json();
+    const allTunnels = data.elements || [];
+
+   // Filter to only tunnels actually ON the route
+    const onRoute = allTunnels.filter(tunnel => {
+      if (!tunnel.geometry || tunnel.geometry.length === 0) return false;
+      const midIndex = Math.floor(tunnel.geometry.length / 2);
+      const midPoint = tunnel.geometry[midIndex];
+      return isNearRoute(midPoint.lat, midPoint.lon, points, 5);
+    });
+
+    // Deduplicate by name
+    const seen = new Set();
+    const deduplicated = onRoute.filter(tunnel => {
+      const name = tunnel.tags?.name || tunnel.tags?.description || 'unnamed';
+      if (seen.has(name)) return false;
+      seen.add(name);
+      return true;
+    });
+
+    return deduplicated;
+  } catch (err) {
+    console.log('Overpass error:', err);
+    return [];
+  }
+};
+
 export default function App() {
   const [destination, setDestination] = useState('');
   const [loading, setLoading] = useState(false);
   const [routeData, setRouteData] = useState(null);
   const [deadZones, setDeadZones] = useState([]);
   const [error, setError] = useState(null);
-
-  const getDeadZones = async (points) => {
-    // Build bounding box around route points
-    const lats = points.map(p => p[0]);
-    const lngs = points.map(p => p[1]);
-    const south = Math.min(...lats);
-    const north = Math.max(...lats);
-    const west = Math.min(...lngs);
-    const east = Math.max(...lngs);
-
-    // Query OpenStreetMap Overpass API for tunnels
-    const query = `
-      [out:json];
-      way["tunnel"="yes"](${south},${west},${north},${east});
-      out geom;
-    `;
-
-    try {
-      const response = await fetch('https://overpass-api.de/api/interpreter', {
-        method: 'POST',
-        body: query,
-      });
-      const data = await response.json();
-      return data.elements || [];
-    } catch (err) {
-      console.log('Overpass error:', err);
-      return [];
-    }
-  };
 
   const previewRoute = async () => {
     setLoading(true);
