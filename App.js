@@ -4,6 +4,7 @@ import {
   ActivityIndicator, ScrollView
 } from 'react-native';
 import { useState } from 'react';
+import StreetPreview from './StreetPreview';
 import { GOOGLE_MAPS_API_KEY, ANTHROPIC_API_KEY } from './Config';
 import polyline from '@mapbox/polyline';
 
@@ -125,6 +126,17 @@ export default function App() {
   const [routeData, setRouteData] = useState(null);
   const [deadZones, setDeadZones] = useState([]);
   const [error, setError] = useState(null);
+const [showPreview, setShowPreview] = useState(false);
+const [waypoints, setWaypoints] = useState([]);
+
+const calculateHeading = (from, to) => {
+  const dLng = (to.lng - from.lng) * Math.PI / 180;
+  const lat1 = from.lat * Math.PI / 180;
+  const lat2 = to.lat * Math.PI / 180;
+  const y = Math.sin(dLng) * Math.cos(lat2);
+  const x = Math.cos(lat1) * Math.sin(lat2) - Math.sin(lat1) * Math.cos(lat2) * Math.cos(dLng);
+  return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+};
 
   const previewRoute = async () => {
     setLoading(true);
@@ -157,13 +169,26 @@ const coached = await Promise.all(
   })
 );
 
+// Extract waypoints from steps for Street View
+const routeWaypoints = route.steps.map((step, index) => ({
+  lat: step.end_location.lat,
+  lng: step.end_location.lng,
+  instruction: step.html_instructions.replace(/<[^>]*>/g, ''),
+  heading: index > 0 ? calculateHeading(
+    route.steps[index - 1].end_location,
+    step.end_location
+  ) : 0,
+  isDeadZone: false,
+}));
+
+setWaypoints(routeWaypoints);
 setRouteData({
-          distance: route.distance.text,
-          duration: route.duration.text,
-          steps: route.steps.length,
-          start: route.start_address,
-          end: route.end_address,
-        });
+  distance: route.distance.text,
+  duration: route.duration.text,
+  steps: route.steps.length,
+  start: route.start_address,
+  end: route.end_address,
+});
 
        setDeadZones(coached);
 
@@ -177,8 +202,17 @@ setRouteData({
     }
   };
 
+ if (showPreview) {
   return (
-    <SafeAreaView style={styles.container}>
+    <StreetPreview
+      route={{ waypoints }}
+      onBack={() => setShowPreview(false)}
+    />
+  );
+}
+
+return (
+  <SafeAreaView style={styles.container}>
       <ScrollView contentContainerStyle={styles.inner}>
 
         {/* Header */}
@@ -220,6 +254,12 @@ setRouteData({
         {routeData && (
           <View style={styles.resultCard}>
             <Text style={styles.resultTitle}>Route Found ✓</Text>
+<TouchableOpacity
+  style={styles.previewButton}
+  onPress={() => setShowPreview(true)}
+>
+  <Text style={styles.previewButtonText}>👁  View Street Preview →</Text>
+</TouchableOpacity>
 
             <View style={styles.statRow}>
               <View style={styles.stat}>
@@ -450,7 +490,21 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     color: '#4ADE80',
   },
-  badge: {
+
+previewButton: {
+  backgroundColor: '#0D2D4A',
+  borderRadius: 10,
+  padding: 14,
+  alignItems: 'center',
+  borderWidth: 1,
+  borderColor: '#1565C0',
+},
+previewButtonText: {
+  color: '#64B5F6',
+  fontSize: 14,
+  fontWeight: '700',
+},
+badge: {
     backgroundColor: '#1E2D3D',
     borderRadius: 100,
     paddingVertical: 12,
