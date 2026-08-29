@@ -8,6 +8,67 @@ import StreetPreview from './StreetPreview';
 import { GOOGLE_MAPS_API_KEY, ANTHROPIC_API_KEY } from './Config';
 import polyline from '@mapbox/polyline';
 
+// A waypoint this close to a tunnel midpoint counts as being in the zone.
+const DEAD_ZONE_PROXIMITY_METERS = 200;
+// Hard ceiling on Claude calls per route, so a tunnel-heavy route cannot
+// fan out into dozens of requests.
+const MAX_COACHED_ZONES = 8;
+// Spacing between sequential Claude calls.
+const COACHING_GAP_MS = 350;
+const REQUEST_TIMEOUT_MS = 15000;
+const OVERPASS_TIMEOUT_MS = 25000;
+const MAX_DESTINATION_LENGTH = 200;
+
+const COACHING_FALLBACK = 'Stay alert and note your surroundings before signal drops.';
+
+const DIRECTIONS_STATUS_MESSAGES = {
+  ZERO_RESULTS: 'No driving route found to that destination. Try a more specific address.',
+  NOT_FOUND: 'We could not find that destination. Check the spelling and try again.',
+  OVER_QUERY_LIMIT: 'Too many route lookups right now. Wait a moment and try again.',
+  OVER_DAILY_LIMIT: 'Route lookups are unavailable right now (daily quota reached).',
+  REQUEST_DENIED: 'Route lookup was denied. Check the Google Maps API key configuration.',
+  INVALID_REQUEST: 'That destination could not be read. Try a different address.',
+  MAX_ROUTE_LENGTH_EXCEEDED: 'That route is too long to preview.',
+  UNKNOWN_ERROR: 'Google Maps had a temporary error. Try again.',
+};
+
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Every network call goes through this, so a hung request cannot leave the
+// app spinning forever.
+const fetchWithTimeout = async (url, options = {}, timeoutMs = REQUEST_TIMEOUT_MS) => {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+};
+
+// Free text -> safe query string. It is still URL-encoded at the call site;
+// this strips control characters, collapses whitespace and caps length so a
+// pathological paste cannot build a giant URL.
+const sanitizeDestination = (raw) => {
+  if (typeof raw !== 'string') return '';
+  return raw
+    .replace(/[\u0000-\u001F\u007F]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, MAX_DESTINATION_LENGTH);
+};
+
+// Google returns turn text as HTML; React Native Text renders it literally.
+const stripHtml = (value) => (
+  typeof value === 'string' ? value.replace(/<[^>]*>/g, '').trim() : ''
+);
+
+const tunnelMidpoint = (tunnel) => {
+  const geometry = tunnel?.geometry;
+  if (!Array.isArray(geometry) || geometry.length === 0) return null;
+  return geometry[Math.floor(geometry.length / 2)] || null;
+};
+
 // Check if a point is close enough to the route line
 const isNearRoute = (tunnelLat, tunnelLng, routePoints, thresholdMeters = 50) => {
   for (let i = 0; i < routePoints.length - 1; i++) {
@@ -44,9 +105,25 @@ const haversineDistance = (lat1, lng1, lat2, lng2) => {
   return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 };
 
+// True when a waypoint sits within DEAD_ZONE_PROXIMITY_METERS of any
+// detected tunnel midpoint.
+const isNearDeadZone = (lat, lng, zones) => zones.some((zone) => {
+  const midPoint = tunnelMidpoint(zone);
+  if (!midPoint) return false;
+  return haversineDistance(lat, lng, midPoint.lat, midPoint.lon) <= DEAD_ZONE_PROXIMITY_METERS;
+});
+
+const parseRetryAfterMs = (headerValue) => {
+  const seconds = Number(headerValue);
+  if (Number.isFinite(seconds) && seconds > 0) return Math.min(seconds * 1000, 10000);
+  return null;
+};
+
+// Never throws. Returns { coaching, failed, retryable, retryAfterMs } so the
+// caller can tell a real tip from the static fallback.
 const getCoachingScript = async (zoneName) => {
   try {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
+    const response = await fetchWithTimeout('https://api.anthropic.com/v1/messages', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -65,13 +142,67 @@ const getCoachingScript = async (zoneName) => {
         }]
       })
     });
+
+    if (!response.ok) {
+      return {
+        coaching: COACHING_FALLBACK,
+        failed: true,
+        // 429 and 5xx are worth one retry; 400/401/403 are not.
+        retryable: response.status === 429 || response.status >= 500,
+        retryAfterMs: parseRetryAfterMs(response.headers?.get?.('retry-after')),
+      };
+    }
+
     const data = await response.json();
-    return data.content[0].text;
+    // An error payload has no content array - reading content[0].text
+    // directly threw a TypeError here.
+    const text = data?.content?.[0]?.text;
+
+    if (typeof text !== 'string' || text.trim() === '') {
+      return { coaching: COACHING_FALLBACK, failed: true, retryable: false, retryAfterMs: null };
+    }
+
+    return { coaching: text.trim(), failed: false, retryable: false, retryAfterMs: null };
   } catch (err) {
-    return 'Stay alert and note your surroundings before signal drops.';
+    return { coaching: COACHING_FALLBACK, failed: true, retryable: true, retryAfterMs: null };
   }
 };
 
+// Sequential on purpose: Promise.all fired one Claude request per dead zone
+// simultaneously, which trips rate limits on tunnel-heavy routes.
+const coachDeadZones = async (tunnels) => {
+  const coached = [];
+  let coachingFailures = 0;
+
+  const targets = tunnels.slice(0, MAX_COACHED_ZONES);
+
+  for (let i = 0; i < targets.length; i++) {
+    const zone = targets[i];
+    const name = zone.tags?.name || zone.tags?.description || 'this tunnel';
+
+    if (i > 0) await sleep(COACHING_GAP_MS);
+
+    let outcome = await getCoachingScript(name);
+
+    if (outcome.failed && outcome.retryable) {
+      await sleep(outcome.retryAfterMs ?? 1500);
+      outcome = await getCoachingScript(name);
+    }
+
+    if (outcome.failed) coachingFailures += 1;
+    coached.push({ ...zone, coaching: outcome.coaching });
+  }
+
+  // Zones past the cap still render, with the static tip.
+  for (const zone of tunnels.slice(MAX_COACHED_ZONES)) {
+    coached.push({ ...zone, coaching: COACHING_FALLBACK });
+  }
+
+  return { zones: coached, coachingFailures };
+};
+
+// Returns { tunnels, failed }. An empty list because the scan failed is NOT
+// the same as an empty list because the route is clear.
 const getDeadZones = async (points) => {
   const lats = points.map(p => p[0]);
   const lngs = points.map(p => p[1]);
@@ -89,18 +220,21 @@ const getDeadZones = async (points) => {
   `;
 
   try {
-    const response = await fetch('https://overpass-api.de/api/interpreter', {
-      method: 'POST',
-      body: query,
-    });
+    const response = await fetchWithTimeout(
+      'https://overpass-api.de/api/interpreter',
+      { method: 'POST', body: query },
+      OVERPASS_TIMEOUT_MS
+    );
+
+    if (!response.ok) return { tunnels: [], failed: true };
+
     const data = await response.json();
-    const allTunnels = data.elements || [];
+    const allTunnels = Array.isArray(data?.elements) ? data.elements : [];
 
    // Filter to only tunnels actually ON the route
     const onRoute = allTunnels.filter(tunnel => {
-      if (!tunnel.geometry || tunnel.geometry.length === 0) return false;
-      const midIndex = Math.floor(tunnel.geometry.length / 2);
-      const midPoint = tunnel.geometry[midIndex];
+      const midPoint = tunnelMidpoint(tunnel);
+      if (!midPoint) return false;
       return isNearRoute(midPoint.lat, midPoint.lon, points, 5);
     });
 
@@ -113,10 +247,9 @@ const getDeadZones = async (points) => {
       return true;
     });
 
-    return deduplicated;
+    return { tunnels: deduplicated, failed: false };
   } catch (err) {
-    console.log('Overpass error:', err);
-    return [];
+    return { tunnels: [], failed: true };
   }
 };
 
@@ -128,6 +261,7 @@ export default function App() {
   const [error, setError] = useState(null);
 const [showPreview, setShowPreview] = useState(false);
 const [waypoints, setWaypoints] = useState([]);
+const [scanWarning, setScanWarning] = useState(null);
 
 const calculateHeading = (from, to) => {
   const dLng = (to.lng - from.lng) * Math.PI / 180;
@@ -139,64 +273,104 @@ const calculateHeading = (from, to) => {
 };
 
   const previewRoute = async () => {
+    const query = sanitizeDestination(destination);
+
+    if (!query) {
+      setError('Enter a destination first.');
+      return;
+    }
+
     setLoading(true);
     setError(null);
+    setScanWarning(null);
     setRouteData(null);
     setDeadZones([]);
+    setWaypoints([]);
 
     try {
-      const response = await fetch(
-        `https://maps.googleapis.com/maps/api/directions/json?origin=Randolph+MA&destination=${encodeURIComponent(destination)}&key=${GOOGLE_MAPS_API_KEY}`
+      const response = await fetchWithTimeout(
+        `https://maps.googleapis.com/maps/api/directions/json?origin=Randolph+MA&destination=${encodeURIComponent(query)}&key=${GOOGLE_MAPS_API_KEY}`
       );
+
+      if (!response.ok) {
+        setError('Could not reach the route service. Check your connection and try again.');
+        return;
+      }
+
       const data = await response.json();
 
-      if (data.status === 'OK') {
-        const route = data.routes[0].legs[0];
+      if (data.status !== 'OK') {
+        setError(
+          DIRECTIONS_STATUS_MESSAGES[data.status]
+          || 'Could not find a route to that destination.'
+        );
+        return;
+      }
 
-        // Decode the polyline into GPS coordinates
-        const encoded = data.routes[0].overview_polyline.points;
-        const points = polyline.decode(encoded);
+      const route = data?.routes?.[0]?.legs?.[0];
+      const encoded = data?.routes?.[0]?.overview_polyline?.points;
 
-        // Scan for dead zones
-const tunnels = await getDeadZones(points);
+      if (!route || !encoded) {
+        setError('That route came back incomplete. Try a different destination.');
+        return;
+      }
 
-// Get AI coaching for each dead zone
-const coached = await Promise.all(
-  tunnels.map(async (zone) => {
-    const name = zone.tags?.name || zone.tags?.description || 'this tunnel';
-    const coaching = await getCoachingScript(name);
-    return { ...zone, coaching };
-  })
-);
+      // Decode the polyline into GPS coordinates
+      const points = polyline.decode(encoded);
 
-// Extract waypoints from steps for Street View
-const routeWaypoints = route.steps.map((step, index) => ({
-  lat: step.end_location.lat,
-  lng: step.end_location.lng,
-  instruction: step.html_instructions.replace(/<[^>]*>/g, ''),
-  heading: index > 0 ? calculateHeading(
-    route.steps[index - 1].end_location,
-    step.end_location
-  ) : 0,
-  isDeadZone: false,
-}));
+      // Drop any step missing coordinates rather than crashing on it later
+      const steps = (Array.isArray(route.steps) ? route.steps : []).filter((step) => (
+        Number.isFinite(step?.end_location?.lat) && Number.isFinite(step?.end_location?.lng)
+      ));
 
-setWaypoints(routeWaypoints);
-setRouteData({
-  distance: route.distance.text,
-  duration: route.duration.text,
-  steps: route.steps.length,
-  start: route.start_address,
-  end: route.end_address,
-});
+      // Scan for dead zones
+      const scan = await getDeadZones(points);
 
-       setDeadZones(coached);
+      // Get AI coaching for each dead zone (sequential - see coachDeadZones)
+      const { zones, coachingFailures } = await coachDeadZones(scan.tunnels);
 
-      } else {
-        setError(`Could not find route: ${data.status}`);
+      // Extract waypoints from steps for Street View, flagging any that fall
+      // within DEAD_ZONE_PROXIMITY_METERS of a detected tunnel.
+      const routeWaypoints = steps.map((step, index) => {
+        const lat = step.end_location.lat;
+        const lng = step.end_location.lng;
+
+        return {
+          lat,
+          lng,
+          instruction: stripHtml(step.html_instructions),
+          heading: index > 0 ? calculateHeading(
+            steps[index - 1].end_location,
+            step.end_location
+          ) : 0,
+          isDeadZone: isNearDeadZone(lat, lng, zones),
+        };
+      });
+
+      setWaypoints(routeWaypoints);
+      setRouteData({
+        distance: route.distance?.text ?? '--',
+        duration: route.duration?.text ?? '--',
+        steps: steps.length,
+        start: route.start_address ?? 'Unknown origin',
+        end: route.end_address ?? query,
+      });
+      setDeadZones(zones);
+
+      // Say so when the result is degraded, instead of implying a clear route.
+      if (scan.failed) {
+        setScanWarning(
+          'Dead zone scan unavailable - we could not reach the tunnel database, '
+          + 'so this route has not been checked for GPS dead zones.'
+        );
+      } else if (coachingFailures > 0) {
+        setScanWarning(
+          `AI coaching unavailable for ${coachingFailures} of ${zones.length} dead `
+          + 'zone(s) - showing standard guidance for those instead.'
+        );
       }
     } catch (err) {
-      setError('Something went wrong. Check your connection.');
+      setError('Something went wrong. Check your connection and try again.');
     } finally {
       setLoading(false);
     }
@@ -230,10 +404,13 @@ return (
             placeholderTextColor="#64748B"
             value={destination}
             onChangeText={setDestination}
+            maxLength={MAX_DESTINATION_LENGTH}
+            returnKeyType="search"
+            onSubmitEditing={previewRoute}
           />
           <TouchableOpacity
-            style={[styles.button, !destination && styles.buttonDisabled]}
-            disabled={!destination || loading}
+            style={[styles.button, !destination.trim() && styles.buttonDisabled]}
+            disabled={!destination.trim() || loading}
             onPress={previewRoute}
           >
             {loading
@@ -247,6 +424,13 @@ return (
         {error && (
           <View style={styles.errorCard}>
             <Text style={styles.errorText}>{error}</Text>
+          </View>
+        )}
+
+        {/* Degraded result - partial data, not a clean pass */}
+        {scanWarning && (
+          <View style={styles.warningCard}>
+            <Text style={styles.warningText}>⚠️  {scanWarning}</Text>
           </View>
         )}
 
@@ -305,8 +489,8 @@ return (
           </View>
         )}
 
-        {/* No Dead Zones */}
-        {routeData && deadZones.length === 0 && (
+        {/* No Dead Zones - only claim this when the scan actually ran */}
+        {routeData && deadZones.length === 0 && !scanWarning && (
           <View style={styles.clearCard}>
             <Text style={styles.clearText}>✅  No GPS dead zones on this route</Text>
           </View>
@@ -489,6 +673,17 @@ const styles = StyleSheet.create({
     fontSize: 15,
     fontWeight: '600',
     color: '#4ADE80',
+  },
+  warningCard: {
+    backgroundColor: '#2D1A0E',
+    borderRadius: 16,
+    padding: 20,
+    borderWidth: 1,
+    borderColor: '#92400E',
+  },
+  warningText: {
+    color: '#FED7AA',
+    fontSize: 14,
   },
 
 previewButton: {

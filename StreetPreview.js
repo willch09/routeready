@@ -1,19 +1,75 @@
 import {
   StyleSheet, Text, View, Image,
   TouchableOpacity, SafeAreaView,
-  ActivityIndicator, Dimensions, ScrollView
+  ActivityIndicator, Dimensions
 } from 'react-native';
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { GOOGLE_MAPS_API_KEY } from './Config';
 
 const { width } = Dimensions.get('window');
 
+const METADATA_TIMEOUT_MS = 10000;
+
+// checking = probing coverage, loading = image fetching,
+// ready = image shown, unavailable = no imagery / load failed
+const STATUS = {
+  CHECKING: 'checking',
+  LOADING: 'loading',
+  READY: 'ready',
+  UNAVAILABLE: 'unavailable',
+};
+
 export default function StreetPreview({ route, onBack }) {
   const [currentStep, setCurrentStep] = useState(0);
-  const [imageLoading, setImageLoading] = useState(true);
+  const [status, setStatus] = useState(STATUS.CHECKING);
 
-  const waypoints = route.waypoints || [];
+  const waypoints = Array.isArray(route?.waypoints) ? route.waypoints : [];
   const total = waypoints.length;
+  const safeStep = Math.min(currentStep, Math.max(total - 1, 0));
+  const current = waypoints[safeStep];
+
+  useEffect(() => {
+    if (!current) return undefined;
+
+    let cancelled = false;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), METADATA_TIMEOUT_MS);
+
+    setStatus(STATUS.CHECKING);
+
+    // Google answers the image endpoint with HTTP 200 and a grey "no imagery"
+    // placeholder when a location has no coverage, so onError never fires for
+    // it. The metadata endpoint is the only way to detect that case up front.
+    (async () => {
+      try {
+        const response = await fetch(
+          `https://maps.googleapis.com/maps/api/streetview/metadata?location=${current.lat},${current.lng}&key=${GOOGLE_MAPS_API_KEY}`,
+          { signal: controller.signal }
+        );
+        if (cancelled) return;
+
+        if (!response.ok) {
+          setStatus(STATUS.LOADING);
+          return;
+        }
+
+        const data = await response.json();
+        if (cancelled) return;
+
+        setStatus(data?.status === 'OK' ? STATUS.LOADING : STATUS.UNAVAILABLE);
+      } catch (err) {
+        // A network error on the probe is not proof there is no coverage.
+        // Let the image attempt proceed and fall back on its onError instead.
+        if (!cancelled) setStatus(STATUS.LOADING);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+      controller.abort();
+    };
+  }, [current?.lat, current?.lng]);
 
   if (total === 0) {
     return (
@@ -26,15 +82,14 @@ export default function StreetPreview({ route, onBack }) {
     );
   }
 
-  const current = waypoints[currentStep];
   const streetViewUrl = `https://maps.googleapis.com/maps/api/streetview?size=600x400&location=${current.lat},${current.lng}&fov=90&heading=${current.heading || 0}&pitch=0&key=${GOOGLE_MAPS_API_KEY}`;
 
   const goNext = () => {
-    if (currentStep < total - 1) setCurrentStep(currentStep + 1);
+    if (safeStep < total - 1) setCurrentStep(safeStep + 1);
   };
 
   const goPrev = () => {
-    if (currentStep > 0) setCurrentStep(currentStep - 1);
+    if (safeStep > 0) setCurrentStep(safeStep - 1);
   };
 
   return (
@@ -46,29 +101,48 @@ export default function StreetPreview({ route, onBack }) {
           <Text style={styles.backText}>← Back</Text>
         </TouchableOpacity>
         <Text style={styles.headerTitle}>Route Preview</Text>
-        <Text style={styles.stepCount}>{currentStep + 1} / {total}</Text>
+        <Text style={styles.stepCount}>{safeStep + 1} / {total}</Text>
       </View>
 
       {/* Street View Image */}
       <View style={styles.imageContainer}>
-        {imageLoading && (
-          <View style={styles.loadingOverlay}>
-            <ActivityIndicator size="large" color="#64B5F6" />
-            <Text style={styles.loadingText}>Loading view...</Text>
+        {status === STATUS.UNAVAILABLE ? (
+          <View style={styles.imageFallback}>
+            <Text style={styles.fallbackIcon}>🛰️</Text>
+            <Text style={styles.fallbackTitle}>No Street View here</Text>
+            <Text style={styles.fallbackText}>
+              Google has no imagery for this point. The turn directions below still apply.
+            </Text>
           </View>
+        ) : (
+          <>
+            {status !== STATUS.READY && (
+              <View style={styles.loadingOverlay}>
+                <ActivityIndicator size="large" color="#64B5F6" />
+                <Text style={styles.loadingText}>Loading view...</Text>
+              </View>
+            )}
+            {status !== STATUS.CHECKING && (
+              <Image
+                key={streetViewUrl}
+                source={{ uri: streetViewUrl }}
+                style={styles.streetImage}
+                // onLoadEnd fires after onError too, so never let it
+                // overwrite a failure back into a "ready" state.
+                onLoadEnd={() => setStatus((prev) => (
+                  prev === STATUS.UNAVAILABLE ? prev : STATUS.READY
+                ))}
+                onError={() => setStatus(STATUS.UNAVAILABLE)}
+                resizeMode="cover"
+              />
+            )}
+          </>
         )}
-        <Image
-          source={{ uri: streetViewUrl }}
-          style={styles.streetImage}
-          onLoadStart={() => setImageLoading(true)}
-          onLoadEnd={() => setImageLoading(false)}
-          resizeMode="cover"
-        />
       </View>
 
       {/* Step Info */}
       <View style={styles.infoCard}>
-        <Text style={styles.stepLabel}>STOP {currentStep + 1}</Text>
+        <Text style={styles.stepLabel}>STOP {safeStep + 1}</Text>
         <Text style={styles.stepName}>{current.instruction || 'Continue on route'}</Text>
         {current.isDeadZone && (
           <View style={styles.deadZoneBadge}>
@@ -79,23 +153,23 @@ export default function StreetPreview({ route, onBack }) {
 
       {/* Progress Bar */}
       <View style={styles.progressBar}>
-        <View style={[styles.progressFill, { width: `${((currentStep + 1) / total) * 100}%` }]} />
+        <View style={[styles.progressFill, { width: `${((safeStep + 1) / total) * 100}%` }]} />
       </View>
 
       {/* Navigation Buttons */}
       <View style={styles.navRow}>
         <TouchableOpacity
-          style={[styles.navButton, currentStep === 0 && styles.navDisabled]}
+          style={[styles.navButton, safeStep === 0 && styles.navDisabled]}
           onPress={goPrev}
-          disabled={currentStep === 0}
+          disabled={safeStep === 0}
         >
           <Text style={styles.navText}>← Previous</Text>
         </TouchableOpacity>
 
         <TouchableOpacity
-          style={[styles.navButton, styles.navPrimary, currentStep === total - 1 && styles.navDisabled]}
+          style={[styles.navButton, styles.navPrimary, safeStep === total - 1 && styles.navDisabled]}
           onPress={goNext}
-          disabled={currentStep === total - 1}
+          disabled={safeStep === total - 1}
         >
           <Text style={[styles.navText, styles.navPrimaryText]}>Next →</Text>
         </TouchableOpacity>
@@ -162,6 +236,27 @@ const styles = StyleSheet.create({
   loadingText: {
     color: '#64B5F6',
     fontSize: 14,
+  },
+  imageFallback: {
+    width: '100%',
+    height: '100%',
+    justifyContent: 'center',
+    alignItems: 'center',
+    paddingHorizontal: 32,
+    gap: 8,
+  },
+  fallbackIcon: {
+    fontSize: 32,
+  },
+  fallbackTitle: {
+    color: '#FFFFFF',
+    fontSize: 16,
+    fontWeight: '700',
+  },
+  fallbackText: {
+    color: '#8CA3B8',
+    fontSize: 13,
+    textAlign: 'center',
   },
   infoCard: {
     margin: 20,
