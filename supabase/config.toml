@@ -1,0 +1,8 @@
+# Per-function configuration. See https://supabase.com/docs/guides/cli/config
+#
+# verify_jwt is off because RouteReady has no Supabase Auth - there is no user
+# session, so there is no user JWT for the platform check to validate. The
+# function does its own check instead: the caller must present a valid project
+# key. Turn this back on if you add Supabase Auth (even anonymous sign-in).
+[functions.coaching]
+verify_jwt = false

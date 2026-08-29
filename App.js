@@ -5,7 +5,7 @@ import {
 } from 'react-native';
 import { useState } from 'react';
 import StreetPreview from './StreetPreview';
-import { GOOGLE_MAPS_API_KEY, ANTHROPIC_API_KEY } from './Config';
+import { GOOGLE_MAPS_API_KEY, SUPABASE_URL, SUPABASE_ANON_KEY } from './Config';
 import polyline from '@mapbox/polyline';
 
 // A waypoint this close to a tunnel midpoint counts as being in the zone.
@@ -20,6 +20,11 @@ const OVERPASS_TIMEOUT_MS = 25000;
 const MAX_DESTINATION_LENGTH = 200;
 
 const COACHING_FALLBACK = 'Stay alert and note your surroundings before signal drops.';
+
+// Coaching goes through our Supabase Edge Function, never straight to
+// api.anthropic.com - the Anthropic key must not ship in this bundle.
+// The function owns the model and the prompt; see supabase/README.md.
+const COACHING_ENDPOINT = `${String(SUPABASE_URL || '').replace(/\/+$/, '')}/functions/v1/coaching`;
 
 const DIRECTIONS_STATUS_MESSAGES = {
   ZERO_RESULTS: 'No driving route found to that destination. Try a more specific address.',
@@ -123,24 +128,14 @@ const parseRetryAfterMs = (headerValue) => {
 // caller can tell a real tip from the static fallback.
 const getCoachingScript = async (zoneName) => {
   try {
-    const response = await fetchWithTimeout('https://api.anthropic.com/v1/messages', {
+    const response = await fetchWithTimeout(COACHING_ENDPOINT, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'x-api-key': ANTHROPIC_API_KEY,
-        'anthropic-version': '2023-06-01',
+        apikey: SUPABASE_ANON_KEY,
+        Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
       },
-      body: JSON.stringify({
-        model: 'claude-sonnet-4-20250514',
-        max_tokens: 150,
-        messages: [{
-          role: 'user',
-          content: `You are a calm driving coach. A driver is about to lose GPS signal entering "${zoneName}". 
-          Give them ONE specific, practical coaching tip in 2 sentences max. 
-          Tell them what lane to stay in and what landmark to look for. 
-          Be direct and confident. No fluff.`
-        }]
-      })
+      body: JSON.stringify({ zoneName }),
     });
 
     if (!response.ok) {
@@ -154,9 +149,8 @@ const getCoachingScript = async (zoneName) => {
     }
 
     const data = await response.json();
-    // An error payload has no content array - reading content[0].text
-    // directly threw a TypeError here.
-    const text = data?.content?.[0]?.text;
+    // The function answers { coaching } on success and { error } otherwise.
+    const text = data?.coaching;
 
     if (typeof text !== 'string' || text.trim() === '') {
       return { coaching: COACHING_FALLBACK, failed: true, retryable: false, retryAfterMs: null };
